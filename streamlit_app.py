@@ -10,6 +10,20 @@ import streamlit as st
 
 from payoff_simulator import Debt as SimDebt, PayoffSimulator
 
+try:
+    from decision_engine import IncomeContext
+except Exception:
+    @dataclass
+    class IncomeContext:
+        monthly_income: float
+        monthly_expenses: float = 0.0
+        other_fixed_obligations: float = 0.0
+
+        @property
+        def available_cash(self) -> float:
+            return max(0.0, self.monthly_income - self.monthly_expenses - self.other_fixed_obligations)
+
+
 
 # -----------------------------
 # Data model for the UI
