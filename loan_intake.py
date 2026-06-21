@@ -234,6 +234,16 @@ def enrich_loan(raw: RawLoanInput, current_date: date) -> EnrichedLoan:
     if term_count is not None:
         expected_payments_by_now = min(expected_payments_by_now, term_count)
     missed_payments = max(0, expected_payments_by_now - raw.payments_made)
+
+    # Also mark overdue if the next scheduled payment date has already passed today.
+    # Payment k is due at _advance(start, k), so the next unpaid payment (payments_made+1)
+    # is due at _advance(start, payments_made).  Use strict < to avoid flagging same-day payments.
+    next_payment_date = _advance(start_date, raw.payments_made, raw.payment_frequency) \
+        if (term_count is None or raw.payments_made < term_count) else None
+    if missed_payments == 0 and next_payment_date is not None and next_payment_date < current_date:
+        # The next due date has already passed and it hasn't been paid yet
+        missed_payments = 1
+
     overdue = missed_payments > 0
     overdue_amount = missed_payments * raw.payment_amount
 
@@ -257,9 +267,28 @@ def enrich_loan(raw: RawLoanInput, current_date: date) -> EnrichedLoan:
     priority = max(1, min(10, priority))
     sim_priority = priority + (50 if overdue else 0)  # forces overdue loans to the top of avalanche ranking
 
-    # --- next due date / progress / status ---
-    next_due_date = _advance(start_date, expected_payments_by_now, raw.payment_frequency) if not overdue else \
-        _advance(start_date, raw.payments_made, raw.payment_frequency)
+    # --- next due date ---
+    # _advance(start, n) = due date of the (n+1)th payment.
+    # The next unpaid slot index = max(payments_made, expected_payments_by_now).
+    # If the resulting date is on or before today and the loan is not overdue, it means
+    # today is a payment day that has already been paid (e.g. daily loan paid today),
+    # so the next due date is one period further.
+    _next_slot = max(raw.payments_made, expected_payments_by_now)
+    _candidate_next = (
+        _advance(start_date, _next_slot, raw.payment_frequency)
+        if (term_count is None or _next_slot < term_count)
+        else None
+    )
+    # If not overdue but the candidate next_due is in the past or today, push forward one period
+    # (covers the case where payments_made == expected_by_now and today IS that payment date)
+    if not overdue and _candidate_next is not None and _candidate_next <= current_date:
+        _next_slot_2 = _next_slot + 1
+        _candidate_next = (
+            _advance(start_date, _next_slot_2, raw.payment_frequency)
+            if (term_count is None or _next_slot_2 < term_count)
+            else None
+        )
+    next_due_date = _candidate_next
 
     if term_count:
         repayment_progress_pct = min(100.0, round(100.0 * raw.payments_made / term_count, 1))
