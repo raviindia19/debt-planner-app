@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from payoff_simulator_v3 import Debt as SimDebt, PayoffSimulator
+from payoff_simulator import Debt as SimDebt, PayoffSimulator
 
 
 def default_rows() -> list[dict[str, Any]]:
