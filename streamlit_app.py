@@ -385,6 +385,12 @@ if run:
     work["_risk"] = work.apply(debt_risk_score, axis=1)
 
     available_cash = max(0.0, monthly_income - monthly_expenses - other_fixed)
+    income = IncomeContext(
+        monthly_income=monthly_income,
+        monthly_expenses=monthly_expenses,
+        other_fixed_obligations=other_fixed,
+    )
+
     st.markdown("## Decision output")
     decision_df, needs_choice, recommendation, remaining_cash, paid_map = decision_plan(work, available_cash)
 
@@ -421,15 +427,16 @@ if run:
             income=monthly_income,
             monthly_expenses=monthly_expenses,
             debts=sim_debts,
-            current_date=current_date,
         )
         sim_result = simulator.simulate(verbose=False)
 
+        sim_date = getattr(sim_result, "simulation_date", current_date)
+        total_cost = getattr(sim_result, "total_cost", getattr(sim_result, "total_interest_or_cost", 0.0))
         sim_summary = pd.DataFrame([{
-            "simulation_date": sim_result.simulation_date,
+            "simulation_date": sim_date,
             "months_to_debt_freedom": sim_result.total_months,
             "total_paid": round(sim_result.total_paid, 2),
-            "total_cost": round(sim_result.total_cost, 2),
+            "total_cost": round(total_cost, 2),
             "total_principal_paid": round(sim_result.total_principal_paid, 2),
             "payoff_order": ", ".join(sim_result.payoff_order),
         }])
@@ -448,17 +455,17 @@ if run:
             tl_rows = []
             for x in sim_result.timeline:
                 tl_rows.append({
-                    "month_index": x.month_index,
-                    "month_date": x.month_date,
-                    "debt_name": x.debt_name,
-                    "status": x.status,
-                    "opening_balance": round(x.opening_balance, 2),
-                    "scheduled_payment": round(x.scheduled_payment, 2),
-                    "cost_component": round(x.cost_component, 2),
-                    "principal_paid": round(x.principal_paid, 2),
-                    "extra_payment": round(x.extra_payment, 2),
-                    "closing_balance": round(x.closing_balance, 2),
-                    "note": x.note,
+                    "month_index": getattr(x, "month_index", None),
+                    "month_date": getattr(x, "month_date", None),
+                    "debt_name": getattr(x, "debt_name", ""),
+                    "status": getattr(x, "status", getattr(x, "note", "")),
+                    "opening_balance": round(getattr(x, "opening_balance", 0.0), 2),
+                    "scheduled_payment": round(getattr(x, "scheduled_payment", 0.0), 2),
+                    "cost_component": round(getattr(x, "cost_component", getattr(x, "interest_or_cost", 0.0)), 2),
+                    "principal_paid": round(getattr(x, "principal_paid", 0.0), 2),
+                    "extra_payment": round(getattr(x, "extra_payment", 0.0), 2),
+                    "closing_balance": round(getattr(x, "closing_balance", 0.0), 2),
+                    "note": getattr(x, "note", getattr(x, "status", "")),
                 })
             st.dataframe(pd.DataFrame(tl_rows), use_container_width=True, hide_index=True)
 else:
