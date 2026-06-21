@@ -450,6 +450,7 @@ if run:
         else:
             st.info("No payoff dates yet in the simulation output.")
 
+        
         with st.expander("Show simulation timeline"):
             tl_rows = []
             for x in sim_result.timeline:
