@@ -385,12 +385,6 @@ if run:
     work["_risk"] = work.apply(debt_risk_score, axis=1)
 
     available_cash = max(0.0, monthly_income - monthly_expenses - other_fixed)
-    income = IncomeContext(
-        monthly_income=monthly_income,
-        monthly_expenses=monthly_expenses,
-        other_fixed_obligations=other_fixed,
-    )
-
     st.markdown("## Decision output")
     decision_df, needs_choice, recommendation, remaining_cash, paid_map = decision_plan(work, available_cash)
 
