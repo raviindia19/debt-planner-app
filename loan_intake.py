@@ -281,7 +281,7 @@ def enrich_loan(raw: RawLoanInput, current_date: date) -> EnrichedLoan:
     )
     # If not overdue but the candidate next_due is in the past or today, push forward one period
     # (covers the case where payments_made == expected_by_now and today IS that payment date)
-    if not overdue and _candidate_next is not None and _candidate_next <= current_date:
+    if not overdue and _candidate_next is not None and _candidate_next < current_date:
         _next_slot_2 = _next_slot + 1
         _candidate_next = (
             _advance(start_date, _next_slot_2, raw.payment_frequency)
