@@ -17,11 +17,11 @@ what's actually left to pay, not the original loan-from-day-one numbers.
 """
 
 from dataclasses import dataclass
-from datetime import date
-from typing import List, Dict
+from datetime import date, timedelta
+from typing import List, Dict, Optional
 
 from loan_intake import RawLoanInput, EnrichedLoan, enrich_portfolio, validate_raw_loan
-from payoff_simulator import Debt as SimDebt, PayoffSimulator, SimulationResult, add_months
+from payoff_simulator import Debt as SimDebt, PayoffSimulator, SimulationResult, PaymentLine, add_months
 
 
 @dataclass
@@ -66,16 +66,18 @@ def _virtual_window(loan: EnrichedLoan, current_date: date) -> tuple[date, date]
 
 def to_sim_debt(loan: EnrichedLoan, current_date: date) -> SimDebt:
     start, end = _virtual_window(loan, current_date)
+    # The simulator steps monthly, so EMI must be the calendar-month equivalent
+    # regardless of the loan's actual payment frequency.
+    # Passing loan.payment_amount raw (e.g. 1200/day for Khatu) would make the
+    # simulator treat it as 1200/month — wildly wrong, and the monthly interest
+    # would exceed the EMI causing the loan to never close.
+    emi_monthly = monthly_equivalent(loan)
     return SimDebt(
         name=loan.name,
         principal=loan.total_debt_now,
-        emi=loan.payment_amount,
+        emi=emi_monthly,
         start_date=start,
         end_date=end,
-        # loan_intake already derives this correctly with frequency-aware compounding
-        # (daily/weekly/monthly). Always pass it through rather than letting the
-        # simulator's own calendar-month heuristic recompute it - that heuristic
-        # assumes monthly granularity and silently breaks for daily/weekly loans.
         annual_interest_rate=loan.annual_interest_rate,
         priority=loan.sim_priority,
         notes=loan.notes,
@@ -88,6 +90,84 @@ def monthly_equivalent(loan: EnrichedLoan) -> float:
     if loan.payment_frequency == "weekly":
         return loan.payment_amount * 4.345
     return loan.payment_amount
+
+
+def _expand_timeline(
+    timeline: List[PaymentLine],
+    freq_map: Dict[str, str],
+    per_period_map: Dict[str, float],
+) -> List[PaymentLine]:
+    """
+    The simulator steps monthly.  For daily/weekly loans, each monthly row is
+    expanded into one row per actual payment period so the timeline shows
+    e.g. daily rows for Khatu instead of a single "Month 2, July 21" lump.
+
+    freq_map:       loan_name -> "daily" | "weekly" | "monthly"
+    per_period_map: loan_name -> per-period payment amount (e.g. 1200 for Khatu)
+    """
+    expanded: List[PaymentLine] = []
+    for line in timeline:
+        freq = freq_map.get(line.debt_name, "monthly")
+        if freq == "monthly":
+            expanded.append(line)
+            continue
+
+        # Work out how many sub-periods fit in this simulator month
+        if freq == "daily":
+            step = timedelta(days=1)
+            periods_per_month = 30  # conservative integer for splitting; remaining handled by last row
+        else:  # weekly
+            step = timedelta(weeks=1)
+            periods_per_month = 4
+
+        per_period = per_period_map.get(line.debt_name, line.scheduled_payment / periods_per_month)
+        total_principal = line.principal_paid + line.extra_payment
+        total_interest = line.interest_or_cost
+        total_payment = line.scheduled_payment + line.extra_payment
+
+        # Spread evenly; last sub-row absorbs any remainder so totals match
+        sub_principal = round(total_principal / periods_per_month, 2)
+        sub_interest = round(total_interest / periods_per_month, 2)
+        sub_payment = round(total_payment / periods_per_month, 2)
+
+        balance = line.opening_balance
+        for i in range(periods_per_month):
+            is_last = (i == periods_per_month - 1)
+            sub_date = line.month_date + step * i
+
+            if is_last:
+                # Absorb rounding so total matches
+                p = max(0.0, round(total_principal - sub_principal * (periods_per_month - 1), 2))
+                c = max(0.0, round(total_interest - sub_interest * (periods_per_month - 1), 2))
+                pay = max(0.0, round(total_payment - sub_payment * (periods_per_month - 1), 2))
+            else:
+                p = sub_principal
+                c = sub_interest
+                pay = sub_payment
+
+            closing = max(0.0, round(balance - p, 2))
+            note = line.note if is_last else ("daily EMI" if freq == "daily" else "weekly EMI")
+
+            expanded.append(PaymentLine(
+                month_index=line.month_index,
+                month_date=sub_date,
+                debt_name=line.debt_name,
+                opening_balance=round(balance, 2),
+                scheduled_payment=round(pay - (line.extra_payment / periods_per_month if not is_last else max(0.0, line.extra_payment - (line.extra_payment / periods_per_month) * (periods_per_month - 1))), 2),
+                interest_or_cost=c,
+                principal_paid=p,
+                extra_payment=round(line.extra_payment / periods_per_month, 2) if not is_last else max(0.0, round(line.extra_payment - (line.extra_payment / periods_per_month) * (periods_per_month - 1), 2)),
+                closing_balance=closing,
+                note=note,
+            ))
+            balance = closing
+
+            if closing <= 0.005:
+                break
+
+    # Re-sort by date so monthly and daily rows interleave correctly
+    expanded.sort(key=lambda r: (r.month_date, r.debt_name))
+    return expanded
 
 
 def build_plan(
@@ -129,6 +209,11 @@ def build_plan(
         current_date=current_date,
     )
     sim_result = simulator.simulate(verbose=verbose)
+
+    # 4b. Expand the monthly-stepped timeline into per-period rows for daily/weekly loans
+    freq_map = {L.name: L.payment_frequency for L in enriched}
+    per_period_map = {L.name: L.payment_amount for L in enriched}
+    sim_result.timeline = _expand_timeline(sim_result.timeline, freq_map, per_period_map)
 
     overall_date = max(sim_result.payoff_dates.values()) if sim_result.payoff_dates else current_date
 
