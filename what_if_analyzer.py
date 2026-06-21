@@ -199,7 +199,7 @@ if __name__ == "__main__":
         income_change=0,
         verbose=False,
     )
-
+    
     # Example 2: add a 50k lump sum to Loan 1
     analyze_what_if(
         base_income=100000,
