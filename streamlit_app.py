@@ -1,4 +1,5 @@
 from __future__ import annotations
+from decision_engine import IncomeContext
 
 import math
 from dataclasses import dataclass, asdict
