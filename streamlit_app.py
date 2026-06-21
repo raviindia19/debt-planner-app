@@ -443,7 +443,6 @@ if run:
             debts=sim_debts,
         )
         sim_result = simulator.simulate(verbose=False)
-
         sim_date = getattr(sim_result, "simulation_date", current_date)
         total_cost = getattr(sim_result, "total_cost", getattr(sim_result, "total_interest_or_cost", 0.0))
         sim_summary = pd.DataFrame([{
