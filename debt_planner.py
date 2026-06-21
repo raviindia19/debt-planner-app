@@ -78,7 +78,7 @@ def to_sim_debt(loan: EnrichedLoan, current_date: date) -> SimDebt:
         emi=emi_monthly,
         start_date=start,
         end_date=end,
-        annual_interest_rate=loan.annual_interest_rate,
+        annual_interest_rate=loan.annual_interest_rate if loan.rate_was_explicit else None,
         priority=loan.sim_priority,
         notes=loan.notes,
     )
@@ -214,6 +214,10 @@ def build_plan(
     freq_map = {L.name: L.payment_frequency for L in enriched}
     per_period_map = {L.name: L.payment_amount for L in enriched}
     sim_result.timeline = _expand_timeline(sim_result.timeline, freq_map, per_period_map)
+    
+    for line in sim_result.timeline:
+    if "closed" in line.note:
+        sim_result.payoff_dates[line.debt_name] = line.month_date
 
     overall_date = max(sim_result.payoff_dates.values()) if sim_result.payoff_dates else current_date
 
