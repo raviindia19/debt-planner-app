@@ -205,7 +205,6 @@ def main() -> None:
         income=income.monthly_income,
         monthly_expenses=income.monthly_expenses,
         debts=sim_debts,
-        current_date=current_date,
     )
 
     sim_result = simulator.simulate(verbose=True)
@@ -218,7 +217,7 @@ def main() -> None:
     print(f"Remaining cash after decisions: {decision_result.remaining_cash:.2f}")
     print(f"Simulation months to debt freedom: {sim_result.total_months}")
     print(f"Simulation total paid: {sim_result.total_paid:.2f}")
-    print(f"Simulation total cost: {sim_result.total_cost:.2f}")
+    print(f"Simulation total cost: {getattr(sim_result, 'total_cost', getattr(sim_result, 'total_interest_or_cost', 0.0)):.2f}")
     print(f"Simulation payoff order: {sim_result.payoff_order}")
 
     if decision_result.lines:
