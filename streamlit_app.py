@@ -1,9 +1,9 @@
-
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+import math
+from dataclasses import dataclass, asdict
+from datetime import date
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -13,7 +13,6 @@ from payoff_simulator import Debt as SimDebt, PayoffSimulator
 try:
     from decision_engine import IncomeContext
 except Exception:
-
     @dataclass
     class IncomeContext:
         monthly_income: float
@@ -25,271 +24,247 @@ except Exception:
             return max(0.0, self.monthly_income - self.monthly_expenses - self.other_fixed_obligations)
 
 
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
 
+# -----------------------------
+# Data model for the UI
+# -----------------------------
+@dataclass
+class UiDebt:
+    name: str
+    balance: float
+    due_now: float = 0.0
+    minimum_due: float = 0.0
+    required_to_settle: Optional[float] = None
+    strictness: int = 5
+    commitment_priority: int = 0
+    user_priority: int = 0
+    due_in_days: Optional[int] = None
+    overdue: bool = False
+    partial_ok: bool = False
+    partial_threshold_pct: float = 0.85
 
-def parse_date(value: Any) -> Optional[date]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, date):
-        return value
-    if isinstance(value, pd.Timestamp):
-        return value.date()
-    if isinstance(value, str):
-        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
-            try:
-                return datetime.strptime(value.strip(), fmt).date()
-            except ValueError:
-                continue
-    return None
-
-
-def add_months(d: date, months: int) -> date:
-    year = d.year + (d.month - 1 + months) // 12
-    month = (d.month - 1 + months) % 12 + 1
-    day = min(d.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30,
-                      31, 31, 30, 31, 30, 31][month - 1])
-    return date(year, month, day)
-
-
-def parse_percent(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().upper()
-    if not text or text in {"NA", "N/A", "NONE", "NULL", "-"}:
-        return None
-    text = text.replace("%", "")
-    try:
-        return float(text)
-    except ValueError:
-        return None
-
-
-def parse_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        if pd.isna(value):
-            return None
-        return int(value)
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return int(float(text))
-    except ValueError:
-        return None
-
-
-def compute_end_date(start_date: Optional[date], frequency: str, total_emi_paid: Optional[int]) -> Optional[date]:
-    if start_date is None or total_emi_paid is None or total_emi_paid <= 0:
-        return None
-
-    freq = (frequency or "").strip().lower()
-    steps = max(0, total_emi_paid - 1)
-
-    if "daily" in freq:
-        return start_date + timedelta(days=steps)
-    if "weekly" in freq:
-        return start_date + timedelta(weeks=steps)
-    if "month" in freq or "interest" in freq:
-        return add_months(start_date, steps)
-    if "year" in freq:
-        return date(start_date.year + steps, start_date.month, start_date.day)
-
-    return None
-
-
-# -----------------------------------------------------------------------------
-# Base table (user-facing)
-# -----------------------------------------------------------------------------
-
-TABLE_SCHEMA_VERSION = 2
-
-DISPLAY_COLUMNS = [
-    "Name",
-    "Principal Amount",
-    "Start_Date",
-    "EMI_Date",
-    "EMI Frequency",
-    "EMI Amount",
-    "Total EMI Paid",
-    "Priority",
-    "Annual Interest Rate",
-]
-
-REQUIRED_COLUMNS = DISPLAY_COLUMNS + ["Notes"]
+    emi: float = 0.0
+    start_date: str = "2025-01-01"
+    end_date: str = "2026-01-01"
+    annual_interest_rate: Optional[float] = None
+    track_in_simulator: bool = True
+    notes: str = ""
+    order: int = 0  # lower first; 0 means auto/risk order
 
 
 def default_rows() -> list[dict[str, Any]]:
     return [
-        {
-            "Name": "Family Commitment",
-            "Principal Amount": 50000,
-            "Start_Date": date(2026, 5, 1),
-            "EMI_Date": "1st of Every Month",
-            "EMI Frequency": "Monthly",
-            "EMI Amount": 5000,
-            "Total EMI Paid": 10,
-            "Priority": 10,
-            "Annual Interest Rate": "0%",
-            "Notes": "Family obligation",
-        },
-        {
-            "Name": "Khatu",
-            "Principal Amount": 100000,
-            "Start_Date": date(2026, 5, 1),
-            "EMI_Date": "Daily",
-            "EMI Frequency": "Daily",
-            "EMI Amount": 1200,
-            "Total EMI Paid": 100,
-            "Priority": 5,
-            "Annual Interest Rate": "NA",
-            "Notes": "Daily repayment loan",
-        },
-        {
-            "Name": "Radhe",
-            "Principal Amount": 100000,
-            "Start_Date": date(2026, 2, 1),
-            "EMI_Date": "5th of Every Month",
-            "EMI Frequency": "Only Interest",
-            "EMI Amount": 7000,
-            "Total EMI Paid": 12,
-            "Priority": 8,
-            "Annual Interest Rate": "84%",
-            "Notes": "Interest-only at 7% monthly",
-        },
+        dict(
+            name="Family Commitment",
+            balance=50000.0,
+            due_now=5000.0,
+            minimum_due=5000.0,
+            required_to_settle=5000.0,
+            strictness=9,
+            commitment_priority=10,
+            user_priority=0,
+            due_in_days=0,
+            overdue=False,
+            partial_ok=False,
+            partial_threshold_pct=0.85,
+            emi=0.0,
+            start_date="2025-01-01",
+            end_date="2026-01-01",
+            annual_interest_rate=None,
+            track_in_simulator=False,
+            notes="Family pressure / immediate obligation",
+            order=1,
+        ),
+        dict(
+            name="Daily EMI Loan",
+            balance=165000.0,
+            due_now=36525.0,
+            minimum_due=36525.0,
+            required_to_settle=36525.0,
+            strictness=6,
+            commitment_priority=0,
+            user_priority=0,
+            due_in_days=2,
+            overdue=False,
+            partial_ok=False,
+            partial_threshold_pct=0.85,
+            emi=1200.0,
+            start_date="2025-01-01",
+            end_date="2027-01-01",
+            annual_interest_rate=None,
+            track_in_simulator=True,
+            notes="Daily EMI / fast-draining loan",
+            order=2,
+        ),
+        dict(
+            name="Interest Only 7%",
+            balance=100000.0,
+            due_now=7000.0,
+            minimum_due=7000.0,
+            required_to_settle=7000.0,
+            strictness=8,
+            commitment_priority=0,
+            user_priority=0,
+            due_in_days=5,
+            overdue=False,
+            partial_ok=False,
+            partial_threshold_pct=0.90,
+            emi=7000.0,
+            start_date="2025-01-01",
+            end_date="2030-01-01",
+            annual_interest_rate=7.0,
+            track_in_simulator=True,
+            notes="Interest-only style monthly payment",
+            order=3,
+        ),
     ]
 
 
-def build_dataframe() -> pd.DataFrame:
-    # Reset any old saved table that came from the previous technical schema.
-    if st.session_state.get("debts_schema_version") != TABLE_SCHEMA_VERSION:
-        st.session_state.debts_df = pd.DataFrame(default_rows())
-        st.session_state.debts_schema_version = TABLE_SCHEMA_VERSION
+def debt_risk_score(row: pd.Series) -> float:
+    urgency = 0.0
+    if bool(row.get("overdue", False)):
+        urgency += 1000.0
+    else:
+        due = row.get("due_in_days", None)
+        if pd.notna(due):
+            due = int(due)
+            if due <= 0:
+                urgency += 800.0
+            elif due <= 3:
+                urgency += 500.0
+            elif due <= 7:
+                urgency += 300.0
+            elif due <= 15:
+                urgency += 120.0
+            else:
+                urgency += 40.0
+        else:
+            urgency += 20.0
 
+    commitment = float(row.get("commitment_priority", 0) or 0) * 80.0
+    strictness = float(row.get("strictness", 0) or 0) * 50.0
+    user = float(row.get("user_priority", 0) or 0) * 70.0
+
+    balance = float(row.get("balance", 0) or 0)
+    target = row.get("required_to_settle", None)
+    if pd.isna(target) or target is None or float(target) <= 0:
+        target = float(row.get("minimum_due", 0) or 0)
+        if target <= 0:
+            target = float(row.get("due_now", 0) or 0)
+
+    ratio = (float(target) / balance) if balance > 0 else 1.0
+    settle_eff = (1.0 - min(ratio, 1.0)) * 10.0
+
+    return urgency + commitment + strictness + user + settle_eff * 10.0
+
+
+def row_target_amount(row: pd.Series) -> float:
+    target = row.get("required_to_settle", None)
+    if pd.isna(target) or target is None:
+        target = row.get("minimum_due", 0)
+        if pd.isna(target) or target is None or float(target) <= 0:
+            target = row.get("due_now", 0)
+    return max(0.0, float(target or 0.0))
+
+
+def build_dataframe() -> pd.DataFrame:
     if "debts_df" not in st.session_state:
         st.session_state.debts_df = pd.DataFrame(default_rows())
-        st.session_state.debts_schema_version = TABLE_SCHEMA_VERSION
-
-    df = st.session_state.debts_df.copy()
-    for col in REQUIRED_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    df = df[REQUIRED_COLUMNS].copy()
-    return df
+    return st.session_state.debts_df.copy()
 
 
 def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    work = df.copy()
+    df = df.copy()
 
-    for col in REQUIRED_COLUMNS:
-        if col not in work.columns:
-            work[col] = None
+    # Ensure columns exist
+    required_cols = [
+        "name", "balance", "due_now", "minimum_due", "required_to_settle", "strictness",
+        "commitment_priority", "user_priority", "due_in_days", "overdue", "partial_ok",
+        "partial_threshold_pct", "emi", "start_date", "end_date", "annual_interest_rate",
+        "track_in_simulator", "notes", "order"
+    ]
+    for c in required_cols:
+        if c not in df.columns:
+            df[c] = None
 
-    work["Name"] = work["Name"].fillna("").astype(str)
-    work["Principal Amount"] = pd.to_numeric(work["Principal Amount"], errors="coerce").fillna(0.0)
-    work["Start_Date"] = work["Start_Date"].apply(parse_date)
-    work["EMI_Date"] = work["EMI_Date"].fillna("").astype(str)
-    work["EMI Frequency"] = work["EMI Frequency"].fillna("").astype(str)
-    work["EMI Amount"] = pd.to_numeric(work["EMI Amount"], errors="coerce").fillna(0.0)
-    work["Total EMI Paid"] = work["Total EMI Paid"].apply(parse_int)
-    work["Priority"] = pd.to_numeric(work["Priority"], errors="coerce").fillna(0).astype(int)
-    work["Annual Interest Rate"] = work["Annual Interest Rate"].apply(parse_percent)
-    work["Notes"] = work["Notes"].fillna("").astype(str)
+    # Clean types / fill blanks
+    df["name"] = df["name"].fillna("").astype(str)
+    df["balance"] = pd.to_numeric(df["balance"], errors="coerce").fillna(0.0)
+    df["due_now"] = pd.to_numeric(df["due_now"], errors="coerce").fillna(0.0)
+    df["minimum_due"] = pd.to_numeric(df["minimum_due"], errors="coerce").fillna(0.0)
+    df["required_to_settle"] = pd.to_numeric(df["required_to_settle"], errors="coerce")
+    df["strictness"] = pd.to_numeric(df["strictness"], errors="coerce").fillna(5).astype(int)
+    df["commitment_priority"] = pd.to_numeric(df["commitment_priority"], errors="coerce").fillna(0).astype(int)
+    df["user_priority"] = pd.to_numeric(df["user_priority"], errors="coerce").fillna(0).astype(int)
+    df["due_in_days"] = pd.to_numeric(df["due_in_days"], errors="coerce")
+    df["overdue"] = df["overdue"].fillna(False).astype(bool)
+    df["partial_ok"] = df["partial_ok"].fillna(False).astype(bool)
+    df["partial_threshold_pct"] = pd.to_numeric(df["partial_threshold_pct"], errors="coerce").fillna(0.85)
+    df["emi"] = pd.to_numeric(df["emi"], errors="coerce").fillna(0.0)
+    df["start_date"] = df["start_date"].fillna("2025-01-01").astype(str)
+    df["end_date"] = df["end_date"].fillna("2026-01-01").astype(str)
+    df["annual_interest_rate"] = pd.to_numeric(df["annual_interest_rate"], errors="coerce")
+    df["track_in_simulator"] = df["track_in_simulator"].fillna(True).astype(bool)
+    df["notes"] = df["notes"].fillna("").astype(str)
+    df["order"] = pd.to_numeric(df["order"], errors="coerce").fillna(0).astype(int)
 
-    # Internal fields used by the engine (hidden from the user table)
-    work["balance"] = work["Principal Amount"]
-    work["emi"] = work["EMI Amount"]
-    work["start_date"] = work["Start_Date"].astype(object)
-    work["emi_date"] = work["EMI_Date"]
-    work["emi_frequency"] = work["EMI Frequency"]
-    work["emi_count"] = work["Total EMI Paid"].fillna(0).astype(int)
-    work["end_date"] = [compute_end_date(s, f, c) for s, f, c in zip(work["Start_Date"], work["EMI Frequency"], work["Total EMI Paid"])]
-    work["annual_interest_rate"] = work["Annual Interest Rate"]
-    work["priority"] = work["Priority"]
-
-    # Basic internal defaults so the engine still works.
-    work["due_now"] = work["EMI Amount"]
-    work["minimum_due"] = work["EMI Amount"]
-    work["required_to_settle"] = work["EMI Amount"]
-    work["strictness"] = work["Priority"]
-    work["commitment_priority"] = work["Priority"].where(work["Priority"] >= 8, 0)
-    work["user_priority"] = 0
-    work["due_in_days"] = None
-    work["overdue"] = False
-    work["partial_ok"] = False
-    work["partial_threshold_pct"] = 0.85
-    work["track_in_simulator"] = True
-    work["order"] = 0
-    work["notes"] = work["Notes"]
-
-    return work
-
-
-def find_missing_fields(df: pd.DataFrame) -> list[str]:
-    missing: list[str] = []
+    # Auto-fill required_to_settle if blank
     for idx, row in df.iterrows():
-        row_missing: list[str] = []
-        if not str(row.get("Name", "")).strip():
-            row_missing.append("Name")
-        if float(row.get("Principal Amount", 0) or 0) <= 0:
-            row_missing.append("Principal Amount")
-        if row.get("Start_Date") is None:
-            row_missing.append("Start_Date")
-        if not str(row.get("EMI_Date", "")).strip():
-            row_missing.append("EMI_Date")
-        if not str(row.get("EMI Frequency", "")).strip():
-            row_missing.append("EMI Frequency")
-        if float(row.get("EMI Amount", 0) or 0) <= 0:
-            row_missing.append("EMI Amount")
-        if row.get("Total EMI Paid") is None:
-            row_missing.append("Total EMI Paid")
-        if pd.isna(row.get("Priority", None)):
-            row_missing.append("Priority")
-        if row_missing:
-            missing.append(f"Row {idx + 1} ({row.get('Name', 'Unnamed')}): {', '.join(row_missing)}")
-    return missing
+        if pd.isna(row["required_to_settle"]):
+            target = row["minimum_due"]
+            if pd.isna(target) or float(target) <= 0:
+                target = row["due_now"]
+            df.at[idx, "required_to_settle"] = max(0.0, float(target or 0.0))
+
+    return df
 
 
-# -----------------------------------------------------------------------------
-# Decision / simulation helpers
-# -----------------------------------------------------------------------------
-
-
-def debt_risk_score(row: pd.Series) -> float:
-    score = float(row.get("Priority", 0) or 0) * 100.0
-    rate = parse_percent(row.get("Annual Interest Rate")) or 0.0
-    score += rate
-    if row.get("overdue", False):
-        score += 1000.0
-    return score
-
-
-def decision_plan(df: pd.DataFrame, available_cash: float):
+def decision_plan(df: pd.DataFrame, available_cash: float) -> tuple[pd.DataFrame, bool, str, float, Dict[str, float]]:
+    """
+    Returns:
+    - decision table
+    - needs_user_choice
+    - recommendation
+    - remaining_cash
+    - paid_map
+    """
     work = df.copy()
-    work["_risk"] = work.apply(debt_risk_score, axis=1)
-    ranked = work.sort_values(by=["Priority", "_risk", "Name"], ascending=[False, False, True]).copy()
+
+    # Sort by manual order if any positive order exists; otherwise by risk
+    manual_rows = work[work["order"] > 0].copy()
+    auto_rows = work[work["order"] <= 0].copy()
+
+    manual_rows = manual_rows.sort_values(["order", "name"], ascending=[True, True])
+    if len(manual_rows) > 0:
+        ranked = pd.concat([manual_rows, auto_rows.sort_values(by=["name"])], ignore_index=True)
+        ordering_mode = "manual order"
+    else:
+        ranked = work.sort_values(by=["_risk"], ascending=False) if "_risk" in work.columns else work.copy()
+        ordering_mode = "risk order"
 
     remaining_cash = available_cash
-    rows = []
     paid_map: Dict[str, float] = {}
+    rows = []
     needs_user_choice = False
 
     for _, row in ranked.iterrows():
-        name = str(row["Name"])
-        target = float(row["EMI Amount"] or 0.0)
+        name = str(row["name"])
+        balance = float(row["balance"])
+        target = row_target_amount(row)
+
         if not name.strip() or target <= 0:
             continue
 
         if remaining_cash <= 0:
-            rows.append({"name": name, "target": target, "paid": 0.0, "unpaid": target, "action": "skipped", "reason": "no cash left", "remaining_cash_after": remaining_cash})
+            rows.append({
+                "name": name,
+                "target": target,
+                "paid": 0.0,
+                "unpaid": target,
+                "action": "skipped",
+                "reason": "no cash left",
+                "remaining_cash_after": remaining_cash,
+            })
             continue
 
         if remaining_cash >= target:
@@ -299,64 +274,88 @@ def decision_plan(df: pd.DataFrame, available_cash: float):
             action = "full_settlement"
             reason = "fully settled"
         else:
-            paid = remaining_cash
-            unpaid = target - paid
-            remaining_cash = 0.0
-            action = "partial_payment"
-            reason = "partial payment because cash ran out"
-            needs_user_choice = True
+            ratio = remaining_cash / target if target > 0 else 0.0
+            partial_ok = bool(row.get("partial_ok", False))
+            threshold = float(row.get("partial_threshold_pct", 1.0) or 1.0)
+
+            if partial_ok or ratio >= threshold:
+                paid = remaining_cash
+                unpaid = target - paid
+                remaining_cash = 0.0
+                action = "partial_payment" if partial_ok else "partial_effective"
+                reason = f"partial accepted ({ratio:.0%})"
+            else:
+                paid = 0.0
+                unpaid = target
+                action = "manual_choice"
+                reason = "not enough cash; needs user choice"
+                needs_user_choice = True
 
         paid_map[name] = paid_map.get(name, 0.0) + paid
-        rows.append({"name": name, "target": target, "paid": paid, "unpaid": unpaid, "action": action, "reason": reason, "remaining_cash_after": remaining_cash})
 
-        if unpaid > 0:
+        rows.append({
+            "name": name,
+            "target": target,
+            "paid": paid,
+            "unpaid": unpaid,
+            "action": action,
+            "reason": reason,
+            "remaining_cash_after": remaining_cash,
+        })
+
+        # If we hit a debt that needs user choice, stop the automatic allocation.
+        if action == "manual_choice":
             break
 
     result_df = pd.DataFrame(rows)
-    recommendation = "Used priority order. If cash is short, the app will ask for the next decision or allow partial payment."
+    recommendation = (
+        f"Used {ordering_mode}. "
+        "If cash is short, change the order or allow partial payment for the debt you want to prioritize."
+    )
+
     return result_df, needs_user_choice, recommendation, remaining_cash, paid_map
 
 
 def convert_to_sim_debts(df: pd.DataFrame, paid_map: Dict[str, float]) -> List[SimDebt]:
     sim_debts: List[SimDebt] = []
     for _, row in df.iterrows():
-        name = str(row["Name"])
-        balance = float(row["Principal Amount"] or 0.0)
+        if not bool(row["track_in_simulator"]):
+            continue
+
+        name = str(row["name"])
+        balance = float(row["balance"])
         paid_now = float(paid_map.get(name, 0.0))
         adjusted_balance = max(0.0, balance - paid_now)
+
         if adjusted_balance <= 0:
             continue
 
-        emi = float(row["EMI Amount"] or 0.0)
+        emi = float(row["emi"] or 0.0)
         if emi <= 0:
             continue
-
-        start_dt = parse_date(row["Start_Date"])
-        end_dt = compute_end_date(start_dt, str(row["EMI Frequency"] or ""), parse_int(row["Total EMI Paid"]))
-        annual_rate = parse_percent(row["Annual Interest Rate"])
 
         sim_debts.append(
             SimDebt(
                 name=name,
                 principal=adjusted_balance,
                 emi=emi,
-                start_date=(start_dt or date.today()).isoformat(),
-                end_date=(end_dt or (start_dt or date.today())).isoformat(),
-                annual_interest_rate=annual_rate,
-                priority=int(row["Priority"] or 0),
-                notes=str(row.get("Notes", "")),
+                start_date=str(row["start_date"]),
+                end_date=str(row["end_date"]),
+                annual_interest_rate=(None if pd.isna(row["annual_interest_rate"]) else float(row["annual_interest_rate"])),
+                priority=max(int(row["strictness"]), int(row["commitment_priority"]), int(row["user_priority"])),
+                notes=str(row["notes"]),
             )
         )
     return sim_debts
 
 
-# -----------------------------------------------------------------------------
+# -----------------------------
 # Streamlit UI
-# -----------------------------------------------------------------------------
-
+# -----------------------------
 st.set_page_config(page_title="Debt Planner Engine", layout="wide")
+
 st.title("Debt Planner Engine")
-st.caption("A simple intake table first. Hidden engine fields are derived automatically.")
+st.caption("Decision engine + payoff simulator in one app")
 
 with st.sidebar:
     st.header("Monthly cash")
@@ -367,59 +366,48 @@ with st.sidebar:
 
     st.divider()
     st.write("The app will:")
-    st.write("1. accept a plain-user debt table")
-    st.write("2. derive the internal engine columns")
-    st.write("3. run decision logic and payoff simulation")
+    st.write("1. rank debts")
+    st.write("2. create this month's decision plan")
+    st.write("3. run the payoff simulator using remaining balances")
 
-st.subheader("Debt intake table")
-st.write("Use simple language here. The engine will calculate end date, annualized rate, and remaining balance internally.")
+df = build_dataframe()
+df["_risk"] = df.apply(debt_risk_score, axis=1)
 
-base_df = build_dataframe()
+st.subheader("Edit debts")
+st.write("You can add rows, change order, and adjust partial-payment behavior.")
 edited = st.data_editor(
-    base_df,
+    normalize_dataframe(df),
     num_rows="dynamic",
     use_container_width=True,
     hide_index=True,
     column_config={
-        "Name": st.column_config.TextColumn("Name"),
-        "Principal Amount": st.column_config.NumberColumn("Principal Amount", min_value=0.0),
-        "Start_Date": st.column_config.DateColumn("Start_Date"),
-        "EMI_Date": st.column_config.TextColumn("EMI_Date"),
-        "EMI Frequency": st.column_config.TextColumn("EMI Frequency"),
-        "EMI Amount": st.column_config.NumberColumn("EMI Amount", min_value=0.0),
-        "Total EMI Paid": st.column_config.NumberColumn("Total EMI Paid", min_value=0, step=1, help="Use this as the payment count / tenure so the engine can calculate end date."),
-        "Priority": st.column_config.NumberColumn("Priority", min_value=1, max_value=10, step=1),
-        "Annual Interest Rate": st.column_config.TextColumn("Annual Interest Rate", help="Examples: 84%, 0%, NA"),
-        "Notes": st.column_config.TextColumn("Notes"),
+        "order": st.column_config.NumberColumn("order", help="Lower numbers run first. Use 0 for auto risk order."),
+        "partial_ok": st.column_config.CheckboxColumn("partial_ok", help="Allow partial payment"),
+        "track_in_simulator": st.column_config.CheckboxColumn("track_in_simulator", help="Include in payoff simulation"),
+        "overdue": st.column_config.CheckboxColumn("overdue"),
     },
 )
-
-work = normalize_dataframe(edited)
-st.session_state.debts_df = work[REQUIRED_COLUMNS].copy()
-missing = find_missing_fields(work)
-if missing:
-    with st.expander("Missing info the AI should ask for", expanded=True):
-        for item in missing:
-            st.write(f"- {item}")
 
 col1, col2 = st.columns([1, 2])
 with col1:
     run = st.button("Run decision + simulation", type="primary")
 with col2:
-    st.info("Tip: keep this table simple. The engine will create the hidden internal fields automatically.")
+    st.info("Tip: use order 1,2,3 to force the month-by-month priority you want.")
 
 if run:
-    available_cash = max(0.0, monthly_income - monthly_expenses - other_fixed)
+    work = normalize_dataframe(edited)
+    work["_risk"] = work.apply(debt_risk_score, axis=1)
 
-    st.markdown("## Normalized internal table")
-    st.dataframe(
-        work[["Name", "Principal Amount", "Start_Date", "EMI_Date", "EMI Frequency", "EMI Amount", "Total EMI Paid", "Priority", "Annual Interest Rate", "balance", "end_date", "priority"]],
-        use_container_width=True,
-        hide_index=True,
+    available_cash = max(0.0, monthly_income - monthly_expenses - other_fixed)
+    income = IncomeContext(
+        monthly_income=monthly_income,
+        monthly_expenses=monthly_expenses,
+        other_fixed_obligations=other_fixed,
     )
 
     st.markdown("## Decision output")
     decision_df, needs_choice, recommendation, remaining_cash, paid_map = decision_plan(work, available_cash)
+
     st.dataframe(decision_df, use_container_width=True, hide_index=True)
     st.write(f"**Available cash:** {available_cash:,.2f}")
     st.write(f"**Remaining cash after decision:** {remaining_cash:,.2f}")
@@ -429,52 +417,70 @@ if run:
     st.markdown("## Balances after decision")
     balance_rows = []
     for _, row in work.iterrows():
-        name = str(row["Name"])
-        original = float(row["Principal Amount"] or 0.0)
+        name = str(row["name"])
+        balance = float(row["balance"])
         paid_now = float(paid_map.get(name, 0.0))
+        remaining = max(0.0, balance - paid_now)
         balance_rows.append({
             "name": name,
-            "original_balance": original,
+            "original_balance": balance,
             "paid_now": paid_now,
-            "remaining_balance": max(0.0, original - paid_now),
+            "remaining_balance": remaining,
+            "track_in_simulator": bool(row["track_in_simulator"]),
         })
-    st.dataframe(pd.DataFrame(balance_rows), use_container_width=True, hide_index=True)
+    balance_df = pd.DataFrame(balance_rows)
+    st.dataframe(balance_df, use_container_width=True, hide_index=True)
+
+    sim_debts = convert_to_sim_debts(work, paid_map)
 
     st.markdown("## Payoff simulation")
-    sim_debts = convert_to_sim_debts(work, paid_map)
     if not sim_debts:
         st.warning("No debts were left for simulation after the decision step.")
     else:
-        try:
-            simulator = PayoffSimulator(
-                income=monthly_income,
-                monthly_expenses=monthly_expenses,
-                debts=sim_debts,
-                current_date=current_date,
-            )
-        except TypeError:
-            simulator = PayoffSimulator(
-                income=monthly_income,
-                monthly_expenses=monthly_expenses,
-                debts=sim_debts,
-            )
-
-        sim_result = simulator.simulate(verbose=False)
-        total_cost = getattr(sim_result, "total_cost", getattr(sim_result, "total_interest_or_cost", 0.0))
-        simulation_date = getattr(sim_result, "simulation_date", current_date)
-        st.dataframe(
-            pd.DataFrame([{
-                "simulation_date": simulation_date,
-                "months_to_debt_freedom": getattr(sim_result, "total_months", None),
-                "total_paid": round(getattr(sim_result, "total_paid", 0.0), 2),
-                "total_cost": round(total_cost, 2),
-                "total_principal_paid": round(getattr(sim_result, "total_principal_paid", 0.0), 2),
-                "payoff_order": ", ".join(getattr(sim_result, "payoff_order", [])),
-            }]),
-            use_container_width=True,
-            hide_index=True,
+        simulator = PayoffSimulator(
+            income=monthly_income,
+            monthly_expenses=monthly_expenses,
+            debts=sim_debts,
         )
-        payoff_dates = getattr(sim_result, "payoff_dates", {})
-        if payoff_dates:
-            st.markdown("### Loan-wise clear dates")
-            st.dataframe(pd.DataFrame([{"debt": k, "payoff_date": v} for k, v in payoff_dates.items()]), use_container_width=True, hide_index=True)
+        sim_result = simulator.simulate(verbose=False)
+
+        sim_date = getattr(sim_result, "simulation_date", current_date)
+        total_cost = getattr(sim_result, "total_cost", getattr(sim_result, "total_interest_or_cost", 0.0))
+        sim_summary = pd.DataFrame([{
+            "simulation_date": sim_date,
+            "months_to_debt_freedom": sim_result.total_months,
+            "total_paid": round(sim_result.total_paid, 2),
+            "total_cost": round(total_cost, 2),
+            "total_principal_paid": round(sim_result.total_principal_paid, 2),
+            "payoff_order": ", ".join(sim_result.payoff_order),
+        }])
+        st.dataframe(sim_summary, use_container_width=True, hide_index=True)
+
+        st.write("### Payoff dates")
+        if sim_result.payoff_dates:
+            payoff_df = pd.DataFrame(
+                [{"debt": k, "payoff_date": v} for k, v in sim_result.payoff_dates.items()]
+            )
+            st.dataframe(payoff_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No payoff dates yet in the simulation output.")
+
+        with st.expander("Show simulation timeline"):
+            tl_rows = []
+            for x in sim_result.timeline:
+                tl_rows.append({
+                    "month_index": getattr(x, "month_index", None),
+                    "month_date": getattr(x, "month_date", None),
+                    "debt_name": getattr(x, "debt_name", ""),
+                    "status": getattr(x, "status", getattr(x, "note", "")),
+                    "opening_balance": round(getattr(x, "opening_balance", 0.0), 2),
+                    "scheduled_payment": round(getattr(x, "scheduled_payment", 0.0), 2),
+                    "cost_component": round(getattr(x, "cost_component", getattr(x, "interest_or_cost", 0.0)), 2),
+                    "principal_paid": round(getattr(x, "principal_paid", 0.0), 2),
+                    "extra_payment": round(getattr(x, "extra_payment", 0.0), 2),
+                    "closing_balance": round(getattr(x, "closing_balance", 0.0), 2),
+                    "note": getattr(x, "note", getattr(x, "status", "")),
+                })
+            st.dataframe(pd.DataFrame(tl_rows), use_container_width=True, hide_index=True)
+else:
+    st.info("Edit the debts table and click 'Run decision + simulation'.")
