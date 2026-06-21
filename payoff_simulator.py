@@ -109,6 +109,14 @@ class PaymentLine:
     closing_balance: float
     note: str
 
+    @property
+    def cost_component(self) -> float:
+        return self.interest_or_cost
+
+    @property
+    def status(self) -> str:
+        return self.note
+
 
 @dataclass
 class SimulationResult:
@@ -119,13 +127,25 @@ class SimulationResult:
     payoff_order: List[str]
     payoff_dates: Dict[str, date]
     timeline: List[PaymentLine] = field(default_factory=list)
+    simulation_date: Optional[date] = None
+
+    @property
+    def total_cost(self) -> float:
+        return self.total_interest_or_cost
 
 
 class PayoffSimulator:
-    def __init__(self, income: float, debts: List[Debt], monthly_expenses: float = 0.0) -> None:
+    def __init__(
+        self,
+        income: float,
+        debts: List[Debt],
+        monthly_expenses: float = 0.0,
+        current_date: Optional[date | str] = None,
+    ) -> None:
         self.income = income
         self.monthly_expenses = monthly_expenses
         self.debts = debts
+        self.current_date = parse_date(current_date) if current_date is not None else None
 
     @property
     def disposable_cash(self) -> float:
@@ -175,7 +195,7 @@ class PayoffSimulator:
         timeline: List[PaymentLine] = []
 
         month_index = 0
-        current_date = min(d.start_date for d in self.debts)
+        current_date = self.current_date or min(d.start_date for d in self.debts)
         total_paid = 0.0
         total_interest_or_cost = 0.0
         total_principal_paid = 0.0
@@ -368,6 +388,7 @@ class PayoffSimulator:
             payoff_order=payoff_order,
             payoff_dates=payoff_dates,
             timeline=timeline,
+            simulation_date=current_date,
         )
 
 
