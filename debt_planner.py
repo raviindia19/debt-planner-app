@@ -216,8 +216,8 @@ def build_plan(
     sim_result.timeline = _expand_timeline(sim_result.timeline, freq_map, per_period_map)
     
     for line in sim_result.timeline:
-    if "closed" in line.note:
-        sim_result.payoff_dates[line.debt_name] = line.month_date
+        if "closed" in line.note:
+            sim_result.payoff_dates[line.debt_name] = line.month_date
 
     overall_date = max(sim_result.payoff_dates.values()) if sim_result.payoff_dates else current_date
 
