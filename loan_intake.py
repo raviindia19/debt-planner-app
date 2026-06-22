@@ -63,6 +63,7 @@ class RawLoanInput:
     end_date: Optional[date] = None           # explicit end date, if known
 
     priority: Optional[int] = None            # 1-10, defaults to 5 if not given
+    payment_day: Optional[int] = None         # day-of-month for monthly payments (e.g. 5 for "5th of month")
     notes: str = ""
 
 
@@ -133,6 +134,7 @@ class EnrichedLoan:
 
     priority: int                              # 1-10, as given/defaulted by the user
     sim_priority: int                          # priority with overdue boost baked in, for avalanche ranking
+    payment_day: Optional[int]                 # day-of-month for monthly payments, None = use start_date day
 
     next_due_date: Optional[date]
     expected_close_date: Optional[date]
@@ -238,8 +240,17 @@ def enrich_loan(raw: RawLoanInput, current_date: date) -> EnrichedLoan:
     # Also mark overdue if the next scheduled payment date has already passed today.
     # Payment k is due at _advance(start, k), so the next unpaid payment (payments_made+1)
     # is due at _advance(start, payments_made).  Use strict < to avoid flagging same-day payments.
-    next_payment_date = _advance(start_date, raw.payments_made, raw.payment_frequency) \
+    # Apply payment_day so Radhe's payment correctly lands on the 5th, not the 1st.
+    from calendar import monthrange as _mr
+    def _apply_pday(d: Optional[date]) -> Optional[date]:
+        if d is None or raw.payment_frequency != "monthly" or raw.payment_day is None:
+            return d
+        return d.replace(day=min(raw.payment_day, _mr(d.year, d.month)[1]))
+
+    next_payment_date = _apply_pday(
+        _advance(start_date, raw.payments_made, raw.payment_frequency)
         if (term_count is None or raw.payments_made < term_count) else None
+    )
     if missed_payments == 0 and next_payment_date is not None and next_payment_date < current_date:
         # The next due date has already passed and it hasn't been paid yet
         missed_payments = 1
@@ -268,26 +279,45 @@ def enrich_loan(raw: RawLoanInput, current_date: date) -> EnrichedLoan:
     sim_priority = priority + (50 if overdue else 0)  # forces overdue loans to the top of avalanche ranking
 
     # --- next due date ---
-    # _advance(start, n) = due date of the (n+1)th payment.
-    # The next unpaid slot index = max(payments_made, expected_payments_by_now).
-    # If the resulting date is on or before today and the loan is not overdue, it means
-    # today is a payment day that has already been paid (e.g. daily loan paid today),
-    # so the next due date is one period further.
+    # payment_day overrides the day-of-month for monthly loans (e.g. 5 for "5th of each month").
+    # Without it, we use _advance() which carries through the start_date's day.
+    from calendar import monthrange as _monthrange
+
+    def _apply_payment_day(d: Optional[date]) -> Optional[date]:
+        """Replace the day-of-month if payment_day is set for a monthly loan."""
+        if d is None or raw.payment_frequency != "monthly" or raw.payment_day is None:
+            return d
+        max_day = _monthrange(d.year, d.month)[1]
+        return d.replace(day=min(raw.payment_day, max_day))
+
+    # Compute the raw candidate: next slot index is max(payments_made, expected_by_now)
     _next_slot = max(raw.payments_made, expected_payments_by_now)
-    _candidate_next = (
+    _candidate_next = _apply_payment_day(
         _advance(start_date, _next_slot, raw.payment_frequency)
-        if (term_count is None or _next_slot < term_count)
-        else None
+        if (term_count is None or _next_slot < term_count) else None
     )
-    # If not overdue but the candidate next_due is in the past or today, push forward one period
-    # (covers the case where payments_made == expected_by_now and today IS that payment date)
+
+    # For non-overdue: if candidate <= today (e.g. payment due today but already logged),
+    # push one slot forward so next_due is genuinely upcoming.
     if not overdue and _candidate_next is not None and _candidate_next < current_date:
-        _next_slot_2 = _next_slot + 1
-        _candidate_next = (
-            _advance(start_date, _next_slot_2, raw.payment_frequency)
-            if (term_count is None or _next_slot_2 < term_count)
-            else None
+        _s2 = _next_slot + 1
+        _candidate_next = _apply_payment_day(
+            _advance(start_date, _s2, raw.payment_frequency)
+            if (term_count is None or _s2 < term_count) else None
         )
+
+    # For overdue: next_due must be >= today (the NEXT upcoming payment, not the missed one).
+    # Walk forward one slot at a time until we find a date in the future.
+    if overdue and _candidate_next is not None and _candidate_next < current_date:
+        _slot = _next_slot + 1
+        _candidate_next = None
+        while term_count is None or _slot < term_count:
+            _d = _apply_payment_day(_advance(start_date, _slot, raw.payment_frequency))
+            if _d >= current_date:
+                _candidate_next = _d
+                break
+            _slot += 1
+
     next_due_date = _candidate_next
 
     if term_count:
@@ -329,6 +359,7 @@ def enrich_loan(raw: RawLoanInput, current_date: date) -> EnrichedLoan:
         total_debt_now=total_debt_now,
         priority=priority,
         sim_priority=sim_priority,
+        payment_day=raw.payment_day,
         next_due_date=next_due_date,
         expected_close_date=end_date,
         repayment_progress_pct=repayment_progress_pct,
