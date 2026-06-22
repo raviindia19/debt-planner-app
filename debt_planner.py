@@ -10,12 +10,33 @@ touching debt_engine.py, decision_engine.py, or streamlit_app.py.
 PayoffSimulator.rank_debts() already does avalanche-within-priority-tier
 (priority first, interest rate as tie-break) - so the only job left here
 is building the bridge: turn each EnrichedLoan into a payoff_simulator.Debt
-with the right principal (outstanding + overdue, per Ravi's spec),
-the right priority (overdue gets boosted above everything else), and a
-remaining-term window so the simulator's cost heuristic is computed on
-what's actually left to pay, not the original loan-from-day-one numbers.
+with the right principal (outstanding only - NOT total_debt_now, which
+double-counts the overdue amount), the right priority (overdue gets boosted
+above everything else), and a remaining-term window so the simulator's cost
+heuristic is computed on what's actually left to pay, not the original
+loan-from-day-one numbers.
+
+BUG FIXES (vs previous version)
+--------------------------------
+Fix A – principal double-count (Bug 1):
+    to_sim_debt() now passes loan.outstanding_principal, not loan.total_debt_now.
+    outstanding_principal already covers all remaining payments (including the
+    overdue one), so adding overdue_amount on top was double-counting.
+
+Fix B – payment-day ignored in timeline (Bugs 2 & 3):
+    Added _shift_payment_dates(): after _expand_timeline(), monthly loan rows
+    are moved from the simulator's step-date (e.g. 22nd) to their actual
+    payment_day (e.g. 1st for Family, 5th for Radhe).
+
+Fix C – Khatu reducing-balance instead of flat interest (Bug 4):
+    _expand_timeline() now accepts flat_cost_per_period_map.  For daily/weekly
+    EMI loans whose cost is implied from principal+term (like Khatu's ₹200/day),
+    we use that fixed amount instead of prorating the monthly reducing-balance
+    interest total.  Result: every Khatu day shows exactly ₹200 interest
+    regardless of remaining balance.
 """
 
+from calendar import monthrange as _cal_monthrange
 from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import List, Dict, Optional
@@ -71,14 +92,17 @@ def to_sim_debt(loan: EnrichedLoan, current_date: date) -> SimDebt:
     emi_monthly = monthly_equivalent(loan)
     return SimDebt(
         name=loan.name,
-        principal=loan.total_debt_now,
+        # FIX A: use outstanding_principal, NOT total_debt_now.
+        # outstanding_principal already includes all remaining payments (overdue ones too),
+        # so adding overdue_amount on top was double-counting and inflating the opening balance.
+        principal=loan.outstanding_principal,
         emi=emi_monthly,
         start_date=start,
         end_date=end,
         annual_interest_rate=loan.annual_interest_rate,  # always use derived/explicit rate
         priority=loan.sim_priority,
         interest_type="interest_only" if loan.loan_type == "interest_only" else "emi",
-        # Fix 3: don't process scheduled payments until the loan is actually due.
+        # Don't process scheduled payments until the loan is actually due.
         # next_due_date is guaranteed to be >= today after Fix 1 in loan_intake.
         first_payment_date=loan.next_due_date,
         notes=loan.notes,
@@ -98,15 +122,20 @@ def _expand_timeline(
     freq_map: Dict[str, str],
     per_period_map: Dict[str, float],
     remaining_periods_map: Optional[Dict[str, int]] = None,
+    flat_cost_per_period_map: Optional[Dict[str, float]] = None,
 ) -> List[PaymentLine]:
     """
     The simulator steps monthly.  For daily/weekly loans, each monthly row is
     expanded into one row per actual payment period.
 
-    freq_map:              loan_name -> "daily" | "weekly" | "monthly"
-    per_period_map:        loan_name -> actual per-period payment (e.g. 1200 for Khatu)
-    remaining_periods_map: loan_name -> total remaining periods at simulation start
-                           (used to stop expansion at the correct date instead of always 30 days)
+    freq_map:               loan_name -> "daily" | "weekly" | "monthly"
+    per_period_map:         loan_name -> actual per-period payment (e.g. 1200 for Khatu)
+    remaining_periods_map:  loan_name -> total remaining periods at simulation start
+                            (used to stop expansion at the correct date instead of always 30 days)
+    flat_cost_per_period_map: loan_name -> fixed interest/cost per period (e.g. 200 for Khatu).
+                            When present, this overrides the prorated monthly interest so that
+                            flat-rate loans (like daily finance / Khatu) show a constant interest
+                            component regardless of remaining balance.  (FIX C)
     """
     # Track how many sub-periods have been emitted per loan across all monthly rows.
     periods_used: Dict[str, int] = {}
@@ -130,24 +159,35 @@ def _expand_timeline(
         else:
             n_periods = default_max_per_month
 
-        # Fix 4: use the ACTUAL per-period payment amount (e.g. 1200), not monthly/30.
-        # Interest is spread evenly from the monthly aggregate; principal = payment - interest.
-        per_period_pmt = per_period_map.get(name)  # e.g. 1200 for Khatu
+        # FIX C: for flat-rate loans, use the fixed per-period cost instead of
+        # prorating the monthly reducing-balance interest total.
+        flat_cost = (flat_cost_per_period_map or {}).get(name)
+
         total_interest = line.interest_or_cost
         total_extra = line.extra_payment
         total_principal = line.principal_paid + total_extra
 
-        sub_interest = round(total_interest / n_periods, 2)
+        if flat_cost is not None:
+            # flat-rate: every sub-period gets exactly flat_cost interest
+            sub_interest = flat_cost
+        else:
+            sub_interest = round(total_interest / n_periods, 2)
 
+        per_period_pmt = per_period_map.get(name)  # e.g. 1200 for Khatu
         balance = line.opening_balance
         actual_rows = 0
+
         for i in range(n_periods):
             is_last = (i == n_periods - 1)
             sub_date = line.month_date + step * i
 
-            # Interest component — last row absorbs rounding
-            c = (max(0.0, round(total_interest - sub_interest * (n_periods - 1), 2))
-                 if is_last else sub_interest)
+            # Interest component
+            if flat_cost is not None:
+                # Fixed amount every period; last row absorbs any floating-point residue
+                c = flat_cost
+            else:
+                c = (max(0.0, round(total_interest - sub_interest * (n_periods - 1), 2))
+                     if is_last else sub_interest)
 
             # Scheduled payment = actual per-period amount if known, else pro-rate
             if per_period_pmt is not None:
@@ -193,6 +233,55 @@ def _expand_timeline(
     return expanded
 
 
+def _shift_payment_dates(
+    timeline: List[PaymentLine],
+    enriched: List[EnrichedLoan],
+) -> List[PaymentLine]:
+    """
+    FIX B – move monthly loan rows to their actual payment day.
+
+    The simulator fires all loans on the same monthly step date (e.g. 22nd).
+    This post-processing step replaces each monthly-frequency loan's month_date
+    with its correct payment_day within that same calendar month.
+
+    Examples:
+      Family (payment_day=1):  row dated 2026-07-22 → 2026-07-01
+      Radhe  (payment_day=5):  row dated 2026-07-22 → 2026-07-05
+    """
+    payment_day_map: Dict[str, int] = {
+        L.name: L.payment_day
+        for L in enriched
+        if L.payment_frequency == "monthly" and L.payment_day is not None
+    }
+    if not payment_day_map:
+        return timeline
+
+    shifted: List[PaymentLine] = []
+    for line in timeline:
+        pday = payment_day_map.get(line.debt_name)
+        if pday is None:
+            shifted.append(line)
+            continue
+        d = line.month_date
+        max_day = _cal_monthrange(d.year, d.month)[1]
+        new_date = d.replace(day=min(pday, max_day))
+        shifted.append(PaymentLine(
+            month_index=line.month_index,
+            month_date=new_date,
+            debt_name=line.debt_name,
+            opening_balance=line.opening_balance,
+            scheduled_payment=line.scheduled_payment,
+            interest_or_cost=line.interest_or_cost,
+            principal_paid=line.principal_paid,
+            extra_payment=line.extra_payment,
+            closing_balance=line.closing_balance,
+            note=line.note,
+        ))
+
+    shifted.sort(key=lambda r: (r.month_date, r.debt_name))
+    return shifted
+
+
 def build_plan(
     raw_loans: List[RawLoanInput],
     monthly_income: float,
@@ -233,22 +322,54 @@ def build_plan(
     )
     sim_result = simulator.simulate(verbose=verbose)
 
-    # 4b. Expand monthly-stepped timeline into per-period rows for daily/weekly loans,
-    #     using remaining_periods_map so Khatu stops at day 49 not day 60.
+    # 4b. Build per-loan maps for timeline expansion and date shifting.
     freq_map = {L.name: L.payment_frequency for L in enriched}
     per_period_map = {L.name: L.payment_amount for L in enriched}
+
     remaining_periods_map = {
         L.name: max(1, L.term_count - L.payments_made)
         for L in enriched
         if L.payment_frequency in ("daily", "weekly") and L.term_count is not None
     }
+
+    # FIX C: pre-compute flat cost-per-period for daily/weekly EMI loans where
+    # the interest is implied from principal and term (e.g. Khatu = ₹200/day flat).
+    # This prevents _expand_timeline from inheriting the simulator's reducing-balance
+    # interest split, which would give a different (wrong) interest figure each month.
+    flat_cost_per_period_map: Dict[str, float] = {}
+    for L in enriched:
+        if (
+            L.payment_frequency in ("daily", "weekly")
+            and L.loan_type == "emi"
+            and L.term_count is not None
+            and L.principal_amount > 0
+        ):
+            total_payable = L.payment_amount * L.term_count
+            implied_cost = max(0.0, total_payable - L.principal_amount)
+            if implied_cost > 0:
+                flat_cost_per_period_map[L.name] = implied_cost / L.term_count
+
+    # Expand monthly-stepped timeline into per-period rows for daily/weekly loans.
     sim_result.timeline = _expand_timeline(
-        sim_result.timeline, freq_map, per_period_map, remaining_periods_map
+        sim_result.timeline,
+        freq_map,
+        per_period_map,
+        remaining_periods_map,
+        flat_cost_per_period_map=flat_cost_per_period_map,
     )
-    # Update payoff_dates for daily/weekly loans to the actual date the balance hits 0
-    # (the monthly simulator's date is only an approximation for sub-monthly loans).
+
+    # Update payoff_dates for daily/weekly loans to the actual date the balance hits 0.
     for line in sim_result.timeline:
         if line.closing_balance <= 0.005 and freq_map.get(line.debt_name, "monthly") != "monthly":
+            sim_result.payoff_dates[line.debt_name] = line.month_date
+
+    # FIX B: shift monthly loan rows from the simulator step-date to the loan's
+    # actual payment_day (e.g. Family → 1st, Radhe → 5th).
+    sim_result.timeline = _shift_payment_dates(sim_result.timeline, enriched)
+
+    # Re-sync payoff_dates after the date shift so they reflect the real payment day.
+    for line in sim_result.timeline:
+        if line.closing_balance <= 0.005:
             sim_result.payoff_dates[line.debt_name] = line.month_date
 
     overall_date = max(sim_result.payoff_dates.values()) if sim_result.payoff_dates else current_date
@@ -315,7 +436,7 @@ def print_plan_summary(plan: PlanResult) -> None:
 
 if __name__ == "__main__":
     # Ravi's exact example, dates filled in as he gave them
-    current_date = date(2026, 6, 20)
+    current_date = date(2026, 6, 22)
 
     raw_loans = [
         RawLoanInput(
@@ -326,6 +447,7 @@ if __name__ == "__main__":
             payment_frequency="monthly",
             start_date=date(2026, 5, 1),
             payment_day_rule="1st of every month",
+            payment_day=1,
             payments_made=1,
             term_count=10,
             priority=10,
@@ -352,6 +474,7 @@ if __name__ == "__main__":
             payment_frequency="monthly",
             start_date=date(2026, 2, 1),
             payment_day_rule="5th of every month",
+            payment_day=5,
             payments_made=5,
             priority=8,
             notes="Interest-only lender",
