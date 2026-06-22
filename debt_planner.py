@@ -66,11 +66,8 @@ def _virtual_window(loan: EnrichedLoan, current_date: date) -> tuple[date, date]
 
 def to_sim_debt(loan: EnrichedLoan, current_date: date) -> SimDebt:
     start, end = _virtual_window(loan, current_date)
-    # The simulator steps monthly, so EMI must be the calendar-month equivalent
-    # regardless of the loan's actual payment frequency.
-    # Passing loan.payment_amount raw (e.g. 1200/day for Khatu) would make the
-    # simulator treat it as 1200/month — wildly wrong, and the monthly interest
-    # would exceed the EMI causing the loan to never close.
+    # The simulator steps monthly, so EMI must be the calendar-month equivalent.
+    # For interest_only, the emi stores the per-period amount used to derive periodic_rate.
     emi_monthly = monthly_equivalent(loan)
     return SimDebt(
         name=loan.name,
@@ -78,8 +75,12 @@ def to_sim_debt(loan: EnrichedLoan, current_date: date) -> SimDebt:
         emi=emi_monthly,
         start_date=start,
         end_date=end,
-        annual_interest_rate=loan.annual_interest_rate if loan.rate_was_explicit else None,
+        annual_interest_rate=loan.annual_interest_rate,  # always use derived/explicit rate
         priority=loan.sim_priority,
+        interest_type="interest_only" if loan.loan_type == "interest_only" else "emi",
+        # Fix 3: don't process scheduled payments until the loan is actually due.
+        # next_due_date is guaranteed to be >= today after Fix 1 in loan_intake.
+        first_payment_date=loan.next_due_date,
         notes=loan.notes,
     )
 
@@ -96,74 +97,96 @@ def _expand_timeline(
     timeline: List[PaymentLine],
     freq_map: Dict[str, str],
     per_period_map: Dict[str, float],
+    remaining_periods_map: Optional[Dict[str, int]] = None,
 ) -> List[PaymentLine]:
     """
     The simulator steps monthly.  For daily/weekly loans, each monthly row is
-    expanded into one row per actual payment period so the timeline shows
-    e.g. daily rows for Khatu instead of a single "Month 2, July 21" lump.
+    expanded into one row per actual payment period.
 
-    freq_map:       loan_name -> "daily" | "weekly" | "monthly"
-    per_period_map: loan_name -> per-period payment amount (e.g. 1200 for Khatu)
+    freq_map:              loan_name -> "daily" | "weekly" | "monthly"
+    per_period_map:        loan_name -> actual per-period payment (e.g. 1200 for Khatu)
+    remaining_periods_map: loan_name -> total remaining periods at simulation start
+                           (used to stop expansion at the correct date instead of always 30 days)
     """
+    # Track how many sub-periods have been emitted per loan across all monthly rows.
+    periods_used: Dict[str, int] = {}
     expanded: List[PaymentLine] = []
+
     for line in timeline:
         freq = freq_map.get(line.debt_name, "monthly")
         if freq == "monthly":
             expanded.append(line)
             continue
 
-        # Work out how many sub-periods fit in this simulator month
-        if freq == "daily":
-            step = timedelta(days=1)
-            periods_per_month = 30  # conservative integer for splitting; remaining handled by last row
-        else:  # weekly
-            step = timedelta(weeks=1)
-            periods_per_month = 4
+        step = timedelta(days=1) if freq == "daily" else timedelta(weeks=1)
+        default_max_per_month = 30 if freq == "daily" else 4
 
-        per_period = per_period_map.get(line.debt_name, line.scheduled_payment / periods_per_month)
-        total_principal = line.principal_paid + line.extra_payment
+        # How many sub-periods should this monthly row expand into?
+        name = line.debt_name
+        used_so_far = periods_used.get(name, 0)
+        if remaining_periods_map and name in remaining_periods_map:
+            left = remaining_periods_map[name] - used_so_far
+            n_periods = max(1, min(left, default_max_per_month))
+        else:
+            n_periods = default_max_per_month
+
+        # Fix 4: use the ACTUAL per-period payment amount (e.g. 1200), not monthly/30.
+        # Interest is spread evenly from the monthly aggregate; principal = payment - interest.
+        per_period_pmt = per_period_map.get(name)  # e.g. 1200 for Khatu
         total_interest = line.interest_or_cost
-        total_payment = line.scheduled_payment + line.extra_payment
+        total_extra = line.extra_payment
+        total_principal = line.principal_paid + total_extra
 
-        # Spread evenly; last sub-row absorbs any remainder so totals match
-        sub_principal = round(total_principal / periods_per_month, 2)
-        sub_interest = round(total_interest / periods_per_month, 2)
-        sub_payment = round(total_payment / periods_per_month, 2)
+        sub_interest = round(total_interest / n_periods, 2)
 
         balance = line.opening_balance
-        for i in range(periods_per_month):
-            is_last = (i == periods_per_month - 1)
+        actual_rows = 0
+        for i in range(n_periods):
+            is_last = (i == n_periods - 1)
             sub_date = line.month_date + step * i
 
-            if is_last:
-                # Absorb rounding so total matches
-                p = max(0.0, round(total_principal - sub_principal * (periods_per_month - 1), 2))
-                c = max(0.0, round(total_interest - sub_interest * (periods_per_month - 1), 2))
-                pay = max(0.0, round(total_payment - sub_payment * (periods_per_month - 1), 2))
-            else:
-                p = sub_principal
-                c = sub_interest
-                pay = sub_payment
+            # Interest component — last row absorbs rounding
+            c = (max(0.0, round(total_interest - sub_interest * (n_periods - 1), 2))
+                 if is_last else sub_interest)
 
-            closing = max(0.0, round(balance - p, 2))
+            # Scheduled payment = actual per-period amount if known, else pro-rate
+            if per_period_pmt is not None:
+                sched = per_period_pmt if not is_last else max(0.0, min(per_period_pmt, balance + c))
+            else:
+                sched = round(line.scheduled_payment / n_periods, 2)
+
+            # Principal from scheduled payment
+            p_sched = max(0.0, sched - c)
+
+            # Extra payment — spread pro-rata, last absorbs rounding
+            e = (max(0.0, round(total_extra - round(total_extra / n_periods, 2) * (n_periods - 1), 2))
+                 if is_last else round(total_extra / n_periods, 2))
+            p_extra = e
+
+            p_total = min(p_sched + p_extra, balance)  # can't pay more than balance
+            closing = max(0.0, round(balance - p_total, 2))
+
             note = line.note if is_last else ("daily EMI" if freq == "daily" else "weekly EMI")
 
             expanded.append(PaymentLine(
                 month_index=line.month_index,
                 month_date=sub_date,
-                debt_name=line.debt_name,
+                debt_name=name,
                 opening_balance=round(balance, 2),
-                scheduled_payment=round(pay - (line.extra_payment / periods_per_month if not is_last else max(0.0, line.extra_payment - (line.extra_payment / periods_per_month) * (periods_per_month - 1))), 2),
-                interest_or_cost=c,
-                principal_paid=p,
-                extra_payment=round(line.extra_payment / periods_per_month, 2) if not is_last else max(0.0, round(line.extra_payment - (line.extra_payment / periods_per_month) * (periods_per_month - 1), 2)),
+                scheduled_payment=round(sched, 2),
+                interest_or_cost=round(c, 2),
+                principal_paid=round(p_sched, 2),
+                extra_payment=round(e, 2),
                 closing_balance=closing,
                 note=note,
             ))
             balance = closing
+            actual_rows += 1
 
             if closing <= 0.005:
                 break
+
+        periods_used[name] = used_so_far + actual_rows
 
     # Re-sort by date so monthly and daily rows interleave correctly
     expanded.sort(key=lambda r: (r.month_date, r.debt_name))
@@ -210,13 +233,22 @@ def build_plan(
     )
     sim_result = simulator.simulate(verbose=verbose)
 
-    # 4b. Expand the monthly-stepped timeline into per-period rows for daily/weekly loans
+    # 4b. Expand monthly-stepped timeline into per-period rows for daily/weekly loans,
+    #     using remaining_periods_map so Khatu stops at day 49 not day 60.
     freq_map = {L.name: L.payment_frequency for L in enriched}
     per_period_map = {L.name: L.payment_amount for L in enriched}
-    sim_result.timeline = _expand_timeline(sim_result.timeline, freq_map, per_period_map)
-    
+    remaining_periods_map = {
+        L.name: max(1, L.term_count - L.payments_made)
+        for L in enriched
+        if L.payment_frequency in ("daily", "weekly") and L.term_count is not None
+    }
+    sim_result.timeline = _expand_timeline(
+        sim_result.timeline, freq_map, per_period_map, remaining_periods_map
+    )
+    # Update payoff_dates for daily/weekly loans to the actual date the balance hits 0
+    # (the monthly simulator's date is only an approximation for sub-monthly loans).
     for line in sim_result.timeline:
-        if "closed" in line.note:
+        if line.closing_balance <= 0.005 and freq_map.get(line.debt_name, "monthly") != "monthly":
             sim_result.payoff_dates[line.debt_name] = line.month_date
 
     overall_date = max(sim_result.payoff_dates.values()) if sim_result.payoff_dates else current_date
