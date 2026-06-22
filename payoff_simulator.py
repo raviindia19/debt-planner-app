@@ -40,6 +40,8 @@ class Debt:
     annual_interest_rate: Optional[float] = None  # e.g. 12.0 means 12% p.a.
     payment_day: Optional[int] = None  # unused in v1, kept for future expansion
     priority: int = 0
+    interest_type: str = "emi"          # "emi" | "interest_only"
+    first_payment_date: Optional[date] = None  # skip scheduled payments before this date
     notes: str = ""
 
     def __post_init__(self) -> None:
@@ -166,10 +168,18 @@ class PayoffSimulator:
     def _scheduled_interest_and_principal(self, debt: Debt, balance: float, remaining_months: int) -> Tuple[float, float]:
         """
         Returns (interest_or_cost, principal_component) for the scheduled EMI.
+        - interest_only loans: interest = balance × periodic_rate, principal = 0 always.
         - If explicit interest exists, use amortization-like interest calculation.
         - Otherwise use a straight-line inferred cost spread across remaining months.
         """
         remaining_months = max(1, remaining_months)
+
+        # Fix 5: interest_only loans never reduce principal via scheduled payments.
+        # periodic_rate = emi / original_principal (set at debt creation time).
+        if debt.interest_type == "interest_only":
+            periodic_rate = debt.emi / debt.principal if debt.principal > 0 else 0.0
+            interest = balance * periodic_rate
+            return interest, 0.0
 
         if debt.annual_interest_rate is not None:
             monthly_rate = debt.effective_monthly_rate
@@ -243,20 +253,35 @@ class PayoffSimulator:
                 if st.closed or st.balance <= 0.005:
                     continue
 
+                # Fix 3: don't charge scheduled payment until the loan's first payment date.
+                # (e.g. Family due July 1 should not appear in a June 21 simulation step.)
+                if d.first_payment_date is not None and month_date < d.first_payment_date:
+                    continue
+
                 if month_date > d.end_date:
                     scheduled_payment = 0.0
                 else:
-                    scheduled_payment = min(
-                        d.emi,
-                        st.balance if d.annual_interest_rate is None else st.balance + st.balance * d.effective_monthly_rate,
-                    )
+                    if d.interest_type == "interest_only":
+                        # For interest-only, scheduled = interest on current balance only
+                        periodic_rate = d.emi / d.principal if d.principal > 0 else 0.0
+                        scheduled_payment = st.balance * periodic_rate
+                    elif d.annual_interest_rate is not None:
+                        scheduled_payment = min(
+                            d.emi,
+                            st.balance + st.balance * d.effective_monthly_rate,
+                        )
+                    else:
+                        scheduled_payment = min(d.emi, st.balance)
 
                 opening_balance = st.balance
                 interest_or_cost, principal_component = self._scheduled_interest_and_principal(
                     d, st.balance, max(1, d.term_months - (month_index - 1))
                 )
 
-                if d.annual_interest_rate is not None:
+                # Fix 5: interest_only → zero principal from scheduled payments.
+                if d.interest_type == "interest_only":
+                    principal_from_schedule = 0.0
+                elif d.annual_interest_rate is not None:
                     principal_from_schedule = max(0.0, scheduled_payment - interest_or_cost)
                 else:
                     principal_from_schedule = min(principal_component, opening_balance)
