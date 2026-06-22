@@ -66,7 +66,6 @@ class RawLoanInput:
     payment_day: Optional[int] = None         # day-of-month for monthly payments (e.g. 5 for "5th of month")
     notes: str = ""
 
-
 # ---------------------------------------------------------------------
 # 2. MISSING-FIELD DETECTION - this is the "AI asks the user" step.
 #    Returns plain-English questions, not error codes, so they can be
