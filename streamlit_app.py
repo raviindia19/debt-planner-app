@@ -14,7 +14,7 @@ FREQUENCIES = ["daily", "weekly", "monthly"]
 
 RAW_COLUMNS = [
     "name", "loan_type", "principal_amount", "payment_amount", "payment_frequency",
-    "start_date", "payment_day_rule", "payments_made", "term_count", "end_date",
+    "start_date", "payment_day_rule", "payment_day", "payments_made", "term_count", "end_date",
     "annual_interest_rate", "priority", "notes",
 ]
 
@@ -25,19 +25,19 @@ def default_rows() -> List[Dict[str, Any]]:
         dict(
             name="Family Commitment", loan_type="emi", principal_amount=50000.0,
             payment_amount=5000.0, payment_frequency="monthly", start_date=date(2026, 5, 1),
-            payment_day_rule="1st of every month", payments_made=1, term_count=10, end_date=None,
+            payment_day_rule="1st of every month", payment_day=1, payments_made=1, term_count=10, end_date=None,
             annual_interest_rate=None, priority=10, notes="Family pressure / immediate obligation",
         ),
         dict(
             name="Khatu", loan_type="emi", principal_amount=100000.0,
             payment_amount=1200.0, payment_frequency="daily", start_date=date(2026, 5, 1),
-            payment_day_rule="daily", payments_made=51, term_count=100, end_date=None,
+            payment_day_rule="daily", payment_day=None, payments_made=51, term_count=100, end_date=None,
             annual_interest_rate=None, priority=5, notes="Daily finance loan",
         ),
         dict(
             name="Radhe", loan_type="interest_only", principal_amount=100000.0,
             payment_amount=7000.0, payment_frequency="monthly", start_date=date(2026, 2, 1),
-            payment_day_rule="5th of every month", payments_made=5, term_count=None, end_date=None,
+            payment_day_rule="5th of every month", payment_day=5, payments_made=5, term_count=None, end_date=None,
             annual_interest_rate=None, priority=8, notes="Interest-only lender",
         ),
     ]
@@ -114,6 +114,9 @@ def normalize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["payment_amount"] = pd.to_numeric(df["payment_amount"], errors="coerce").fillna(0.0)
     df["payment_frequency"] = df["payment_frequency"].fillna("monthly").astype(str)
     df["payment_day_rule"] = df["payment_day_rule"].fillna("").astype(str)
+    df["payment_day"] = pd.to_numeric(df["payment_day"], errors="coerce").where(
+        pd.to_numeric(df["payment_day"], errors="coerce").notna(), None
+    ).apply(lambda x: int(x) if x is not None and not pd.isna(x) else None)
     df["payments_made"] = pd.to_numeric(df["payments_made"], errors="coerce").fillna(0).astype(int)
     df["term_count"] = pd.to_numeric(df["term_count"], errors="coerce")
     df["annual_interest_rate"] = pd.to_numeric(df["annual_interest_rate"], errors="coerce")
@@ -145,6 +148,7 @@ def dataframe_to_raw_loans(df: pd.DataFrame) -> List[RawLoanInput]:
                 term_count=_to_int(row.get("term_count")),
                 end_date=_to_date(row.get("end_date")),
                 priority=_to_int(row.get("priority")),
+                payment_day=_to_int(row.get("payment_day")),
                 notes=str(row.get("notes") or ""),
             )
         )
@@ -245,6 +249,11 @@ def render_app() -> None:
             "payment_frequency": st.column_config.SelectboxColumn("Frequency", options=FREQUENCIES, required=True),
             "start_date": st.column_config.DateColumn("Start date"),
             "payment_day_rule": st.column_config.TextColumn("Due date rule (e.g. '5th of month')"),
+            "payment_day": st.column_config.NumberColumn(
+                "Payment day of month",
+                min_value=1, max_value=28, step=1,
+                help="For monthly loans: the day of month payments are due (e.g. 5 for 5th). Leave blank for daily/weekly loans.",
+            ),
             "payments_made": st.column_config.NumberColumn("Payments made so far", min_value=0, step=1),
             "term_count": st.column_config.NumberColumn("Total payments (term)", min_value=0, step=1, help="Leave blank if you gave an end date instead"),
             "end_date": st.column_config.DateColumn("End date (optional)", help="Leave blank if you gave a term instead"),
